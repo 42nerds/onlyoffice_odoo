@@ -1,5 +1,25 @@
 # Change Log
 
+## 4.5.2
+
+## Fixed
+
+- Unauthorized access to local files
+
+## 4.4.2
+
+## Added
+
+- list view for templates
+- new type of reports "onlyoffice-pdf"
+- save filled template to documents
+- scroll to field when clicked
+
+## Fixed
+
+- convert PDF to PDF form
+- field value localization for report generation (date/monetary fields)
+
 ## 4.3.2
 
 ## Added

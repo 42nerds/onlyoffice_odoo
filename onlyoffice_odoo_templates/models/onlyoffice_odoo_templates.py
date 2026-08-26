@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Ascensio System SIA
+# Copyright (C) 2026 Data Dance s.r.o.
+# License LGPL-3.0 or later (https://www.gnuorg/licenses/agpl.html).
+
 import base64
 import json
 import logging
@@ -6,7 +10,6 @@ import time
 
 from odoo import _, api, fields, models, tools
 from odoo.exceptions import UserError
-from odoo.modules import get_module_path
 
 from odoo.addons.onlyoffice_odoo.controllers.controllers import onlyoffice_request
 from odoo.addons.onlyoffice_odoo.utils import config_utils, file_utils, jwt_utils, url_utils
@@ -30,6 +33,7 @@ class OnlyOfficeTemplate(models.Model):
     hide_file_field = fields.Boolean(string="Hide File Field", default=False)
     attachment_id = fields.Many2one("ir.attachment", readonly=True)
     mimetype = fields.Char(default="application/pdf")
+    report_id = fields.Many2one("ir.actions.report", string="Related Report", copy=False)
 
     @api.onchange("name")
     def _onchange_name(self):
@@ -80,42 +84,30 @@ class OnlyOfficeTemplate(models.Model):
 
     @api.model
     def _create_demo_data(self):
-        module_path = get_module_path(self._module)
-        templates_dir = os.path.join(module_path, "data", "templates")
-        if not os.path.exists(templates_dir):
-            return
+        demo_templates = self.env["onlyoffice.odoo.demo.templates"]
+        structure = demo_templates._get_template_structure()
 
-        model_folders = [name for name in os.listdir(templates_dir) if os.path.isdir(os.path.join(templates_dir, name))]
+        for model_name, model_data in structure.items():
+            model = self.env["ir.model"].search([("model", "=", model_name)], limit=1)
+            if not model:
+                continue
 
-        installed_models = self.env["ir.model"].search([])
-        installed_models_list = [(model.model, model.name) for model in installed_models]
+            for file_info in model_data["files"]:
+                name = os.path.splitext(file_info["name"])[0]
 
-        for model_name in model_folders:
-            if any(model_name == model[0] for model in installed_models_list):
-                templates_path = os.path.join(templates_dir, model_name)
-                templates_name = [
-                    name
-                    for name in os.listdir(templates_path)
-                    if os.path.isfile(os.path.join(templates_path, name)) and name.lower().endswith(".pdf")
-                ]
-                for template_name in templates_name:
-                    template_path = os.path.join(templates_path, template_name)
-                    template = open(template_path, "rb")
-                    try:
-                        template_data = template.read()
-                        template_data = base64.encodebytes(template_data)
-                        model = self.env["ir.model"].search([("model", "=", model_name)], limit=1)
-                        name = template_name.rstrip(".pdf")
-                        self.create(
-                            {
-                                "name": name,
-                                "template_model_id": model.id,
-                                "file": template_data,
-                            }
-                        )
-                    finally:
-                        template.close()
-        return
+                try:
+                    content = demo_templates.get_template_content(file_info["path"])
+                except (ValueError, FileNotFoundError, OSError) as e:
+                    logger.error("Failed to process template %s: %s", file_info["path"], str(e))
+                    continue
+
+                self.create(
+                    {
+                        "name": name,
+                        "template_model_id": model.id,
+                        "file": base64.encodebytes(content),
+                    }
+                )
 
     @api.model
     def create(self, vals_list):
@@ -223,11 +215,12 @@ class OnlyOfficeTemplate(models.Model):
             oo_security_token.decode("utf-8") if isinstance(oo_security_token, bytes) else oo_security_token
         )
 
-        conversion_url = os.path.join(docserver_url, "ConvertService.ashx")
+        key = int(time.time())
+        conversion_url = os.path.join(docserver_url, "converter", f"?shardkey={key}")
 
         payload = {
             "url": f"{odoo_url}onlyoffice/template/download/{attachment.id}?oo_security_token={oo_security_token}",
-            "key": int(time.time()),
+            "key": key,
             "filetype": "pdf",
             "outputtype": "pdf",
             "pdf": {
@@ -249,7 +242,7 @@ class OnlyOfficeTemplate(models.Model):
         try:
             response = onlyoffice_request(
                 url=conversion_url,
-                method="get",
+                method="post",
                 opts={
                     "data": json.dumps(payload),
                     "headers": headers,
@@ -331,6 +324,22 @@ class OnlyOfficeTemplate(models.Model):
 
         return records
 
+    def open_template_editor(self):
+        """
+        Open ONLYOFFICE template editor for this record
+        """
+        self.ensure_one()
+        return {
+            "type": "ir.actions.client",
+            "tag": "onlyoffice_template_editor",
+            "target": "current",
+            "params": {
+                "attachment_id": self.attachment_id.id,
+                "id": self.id,
+                "template_model_model": self.template_model_model,
+            },
+        }
+
     @api.model
     def update_relationship(self, template_model_id, model):
         """
@@ -351,3 +360,41 @@ class OnlyOfficeTemplate(models.Model):
         if record.template_model_id != model_id:
             record.template_model_id = model_id
         return
+
+    def create_action(self):
+        """Create associated report action for this template"""
+        for template in self:
+            if not template.report_id:
+                report = self.env["ir.actions.report"].create(
+                    {
+                        "name": f"{template.name} Print (ONLYOFFICE)",
+                        "report_type": "onlyoffice-pdf",
+                        "report_name": template.name,
+                        "onlyoffice_template_id": template.id,
+                        "model": template.template_model_id.model,
+                        "binding_model_id": template.template_model_id.id,
+                    }
+                )
+                template.report_id = report.id
+
+    def unlink_action(self):
+        """Remove associated report action"""
+        for template in self:
+            if template.report_id:
+                template.report_id.unlink()
+
+    def associated_report(self):
+        """Open associated report form"""
+        self.ensure_one()
+        if self.report_id:
+            return {
+                "name": "Associated Report",
+                "type": "ir.actions.act_window",
+                "res_model": "ir.actions.report",
+                "res_id": self.report_id.id,
+                "view_mode": "form",
+            }
+        else:
+            return {
+                "type": "ir.actions.act_window_close",
+            }
